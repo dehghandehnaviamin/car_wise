@@ -9,7 +9,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -94,6 +96,8 @@ type AssistantResponse struct {
 	Results   SearchResponse `json:"results"`
 	Advice    string         `json:"advice"`
 	Tradeoffs []string       `json:"tradeoffs,omitempty"`
+	// IntentSource is "llm" when the model extracted the intent, "fallback" when heuristics did.
+	IntentSource string `json:"intent_source"`
 }
 
 type CompareRecommendation struct {
@@ -108,6 +112,8 @@ type CompareResponse struct {
 	Items                 []Listing               `json:"items"`
 	Recommendations       []CompareRecommendation `json:"recommendations"`
 	OverallRecommendation string                  `json:"overall_recommendation"`
+	// Source is "llm" when the model wrote the recommendations, "fallback" when deterministic rules did.
+	Source string `json:"source"`
 }
 
 type App struct {
@@ -155,13 +161,18 @@ func main() {
 		os.Exit(1)
 	}
 
-	app := &App{db: db, logger: logger, ai: &OpenAI{Key: os.Getenv("OPENAI_API_KEY"), Model: env("OPENAI_MODEL", "gpt-4o-mini")}}
+	app := &App{db: db, logger: logger, ai: &OpenAI{
+		Key:             os.Getenv("OPENAI_API_KEY"),
+		Model:           env("OPENAI_MODEL", "gpt-4o-mini"),
+		BaseURL:         env("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+		ReasoningEffort: os.Getenv("OPENAI_REASONING_EFFORT"),
+	}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/v1/health", app.health)
 	mux.HandleFunc("GET /api/v1/listings", app.listings)
 	mux.HandleFunc("POST /api/v1/assistant/search", app.assistantSearch)
 	mux.HandleFunc("POST /api/v1/compare", app.compare)
-	server := &http.Server{Addr: ":" + env("PORT", "8080"), Handler: securityHeaders(cors(mux)), ReadTimeout: 20 * time.Second, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
+	server := &http.Server{Addr: ":" + env("PORT", "8080"), Handler: securityHeaders(cors(mux)), ReadTimeout: 20 * time.Second, ReadHeaderTimeout: 10 * time.Second, WriteTimeout: 60 * time.Second, IdleTimeout: 60 * time.Second, MaxHeaderBytes: 1 << 20}
 	logger.Info("api listening", "addr", server.Addr)
 	if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		logger.Error("server stopped", "error", err)
@@ -350,10 +361,15 @@ func (a *App) assistantSearch(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "message is required", 400)
 		return
 	}
+	started := time.Now()
+	intentSource := "llm"
 	intent, err := a.ai.ExtractIntent(r.Context(), req.Message)
 	if err != nil {
-		a.logger.Warn("intent extraction fallback", "error", err)
+		intentSource = "fallback"
+		a.logger.Warn("intent extraction fallback", "error", err, "duration", time.Since(started))
 		intent = heuristicIntent(req.Message)
+	} else {
+		a.logger.Info("intent extracted by llm", "model", a.ai.Model, "duration", time.Since(started))
 	}
 	intent.RawQuery = req.Message
 	intent = enrichIntent(intent, req.Message)
@@ -367,7 +383,7 @@ func (a *App) assistantSearch(w http.ResponseWriter, r *http.Request) {
 		req.SessionID = fmt.Sprintf("local-%d", time.Now().UnixNano())
 	}
 	msg, tradeoffs := assistantSummary(intent, items)
-	jsonResponse(w, 200, AssistantResponse{SessionID: req.SessionID, Message: msg, Advice: msg, Tradeoffs: tradeoffs, Intent: intent, Results: SearchResponse{Items: items, Total: len(items), Page: 1, PageSize: len(items), Intent: &intent, Knowledge: knowledge}})
+	jsonResponse(w, 200, AssistantResponse{SessionID: req.SessionID, Message: msg, Advice: msg, Tradeoffs: tradeoffs, Intent: intent, IntentSource: intentSource, Results: SearchResponse{Items: items, Total: len(items), Page: 1, PageSize: len(items), Intent: &intent, Knowledge: knowledge}})
 }
 
 func (a *App) compare(w http.ResponseWriter, r *http.Request) {
@@ -402,15 +418,17 @@ func (a *App) compare(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "one or more listings were not found", http.StatusNotFound)
 		return
 	}
-	recommendations, overall := deterministicCompare(items)
-	if a.ai != nil && a.ai.Key != "" {
-		if llmRecommendations, llmOverall, err := a.ai.ExplainComparison(r.Context(), items); err == nil && len(llmRecommendations) == len(items) {
-			recommendations, overall = llmRecommendations, llmOverall
-		} else if err != nil {
-			a.logger.Warn("comparison explanation fallback", "error", err)
-		}
+	started := time.Now()
+	source := "llm"
+	recommendations, overall, err := a.ai.ExplainComparison(r.Context(), items)
+	if err != nil {
+		source = "fallback"
+		a.logger.Warn("comparison explanation fallback", "error", err, "duration", time.Since(started))
+		recommendations, overall = deterministicCompare(items)
+	} else {
+		a.logger.Info("comparison explained by llm", "model", a.ai.Model, "duration", time.Since(started))
 	}
-	jsonResponse(w, 200, CompareResponse{Items: items, Recommendations: recommendations, OverallRecommendation: overall})
+	jsonResponse(w, 200, CompareResponse{Items: items, Recommendations: recommendations, OverallRecommendation: overall, Source: source})
 }
 
 func deterministicCompare(items []Listing) ([]CompareRecommendation, string) {
@@ -1429,49 +1447,204 @@ func securityHeaders(next http.Handler) http.Handler {
 	})
 }
 
-type OpenAI struct{ Key, Model string }
+type OpenAI struct {
+	Key     string
+	Model   string
+	BaseURL string
+	// ReasoningEffort is sent as reasoning.effort when set; leave empty for models without reasoning support.
+	ReasoningEffort string
+}
 
-func (o *OpenAI) ExtractIntent(ctx context.Context, message string) (Intent, error) {
-	if o.Key == "" {
-		return heuristicIntent(message), nil
+const intentInstructions = "Extract Persian used-car search intent. Return JSON keys: city, min_price_irr, max_price_irr, min_year, max_year, min_mileage_km, max_mileage_km, models, colors, origins, body_conditions, body_types, equipment_levels, powertrains, transmission, usage, priorities, hard_constraints, conflicts, missing_information. Use integer IRR; if user says billions in Iranian car context, interpret as toman and multiply by 10. origins may contain only chinese, iranian, foreign, korean, japanese, german. body_types may contain sedan, hatchback, coupe, suv, pickup. body_conditions may contain no_paint, painted, repaired, accident. powertrains may contain hybrid, electric, combustion. priorities may contain luxury, non_luxury, economic, non_economic, options, no_options, comfort, low_fuel, high_fuel, compact. Infer relations conservatively: economic means <= 5 billion toman, luxury means >= 9 billion toman; small usually hatchback/coupe; comfortable family/highway usually sedan/suv; city driving prefers automatic; offroad/camping prefers suv/pickup; economic+luxury, economic+full-options, and family+hatchback are conflicts. Respect negations such as غیرلوکس, غیراقتصادی, بدون آپشن. Add a field only when requested or strongly implied. Do not invent a model, color, origin, year, or mileage. Types: city and transmission are strings; min/max price, year and mileage fields are integers (0 when unknown); every other key is an array of strings. Respond with a single JSON object and nothing else."
+
+const comparisonInstructions = "You are a careful Persian used-car advisor. Compare only the supplied real listings. Never invent facts, prices, features, or IDs. Return JSON with recommendations (one object per listing, preserving IDs) and overall_recommendation. Each recommendation must have id, title, fit, tradeoffs (array), best_for. Mention uncertainty when source data is missing. Types: id is the integer listing id; title, fit and best_for are Persian strings; tradeoffs is an array of Persian strings; overall_recommendation is one Persian string. Respond with a single JSON object and nothing else."
+
+func (o *OpenAI) responsesURL() string {
+	baseURL := strings.TrimRight(strings.TrimSpace(o.BaseURL), "/")
+	if baseURL == "" {
+		baseURL = "https://api.openai.com/v1"
 	}
-	body := map[string]any{"model": o.Model, "temperature": 0, "response_format": map[string]string{"type": "json_object"}, "messages": []map[string]string{{"role": "system", "content": "Extract Persian used-car search intent. Return JSON keys: city, min_price_irr, max_price_irr, min_year, max_year, min_mileage_km, max_mileage_km, models, colors, origins, body_conditions, body_types, equipment_levels, powertrains, transmission, usage, priorities, hard_constraints, conflicts, missing_information. Use integer IRR; if user says billions in Iranian car context, interpret as toman and multiply by 10. origins may contain only chinese, iranian, foreign, korean, japanese, german. body_types may contain sedan, hatchback, coupe, suv, pickup. body_conditions may contain no_paint, painted, repaired, accident. powertrains may contain hybrid, electric, combustion. priorities may contain luxury, non_luxury, economic, non_economic, options, no_options, comfort, low_fuel, high_fuel, compact. Infer relations conservatively: economic means <= 5 billion toman, luxury means >= 9 billion toman; small usually hatchback/coupe; comfortable family/highway usually sedan/suv; city driving prefers automatic; offroad/camping prefers suv/pickup; economic+luxury, economic+full-options, and family+hatchback are conflicts. Respect negations such as غیرلوکس, غیراقتصادی, بدون آپشن. Add a field only when requested or strongly implied. Do not invent a model, color, origin, year, or mileage."}, {"role": "user", "content": message}}}
-	b, _ := json.Marshal(body)
-	req, _ := http.NewRequestWithContext(ctx, "POST", "https://api.openai.com/v1/chat/completions", strings.NewReader(string(b)))
+	return baseURL + "/responses"
+}
+
+// respondJSON calls the Responses API and decodes the model's JSON answer into out.
+// JSON mode is not requested because some gateways reject text.format, so the
+// instructions must ask for JSON and the object is cut out of the reply text.
+func (o *OpenAI) respondJSON(ctx context.Context, instructions, input string, out any) error {
+	if o == nil || o.Key == "" {
+		return errors.New("llm is not configured")
+	}
+	body := map[string]any{"model": o.Model, "instructions": instructions, "input": input}
+	if o.ReasoningEffort != "" {
+		body["reasoning"] = map[string]string{"effort": o.ReasoningEffort}
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, o.responsesURL(), strings.NewReader(string(b)))
+	if err != nil {
+		return err
+	}
 	req.Header.Set("Authorization", "Bearer "+o.Key)
 	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
+	client := &http.Client{Timeout: 45 * time.Second}
 	resp, err := client.Do(req)
 	if err != nil {
-		return Intent{}, err
+		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		return Intent{}, fmt.Errorf("openai status %s", resp.Status)
+		return fmt.Errorf("llm status %s", resp.Status)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	if err != nil {
-		return Intent{}, fmt.Errorf("openai response read failed")
+		return errors.New("llm response read failed")
 	}
+	text, err := responseText(raw)
+	if err != nil {
+		return err
+	}
+	return lenientUnmarshal([]byte(text), out)
+}
+
+// lenientUnmarshal decodes model JSON into out, coercing near-miss shapes such as a
+// string where a list is expected or a list/object where a string is expected.
+func lenientUnmarshal(data []byte, out any) error {
+	var value any
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	fixed, err := json.Marshal(coerceJSON(value, reflect.TypeOf(out).Elem()))
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(fixed, out)
+}
+
+func coerceJSON(value any, t reflect.Type) any {
+	switch t.Kind() {
+	case reflect.String:
+		return jsonText(value)
+	case reflect.Int, reflect.Int64, reflect.Float64:
+		switch v := value.(type) {
+		case float64:
+			return v
+		case string:
+			if n, err := strconv.ParseFloat(strings.TrimSpace(v), 64); err == nil {
+				return n
+			}
+		}
+		return nil
+	case reflect.Slice:
+		if value == nil {
+			return nil
+		}
+		items, ok := value.([]any)
+		if !ok {
+			items = []any{value}
+		}
+		out := make([]any, 0, len(items))
+		for _, item := range items {
+			out = append(out, coerceJSON(item, t.Elem()))
+		}
+		return out
+	case reflect.Struct:
+		obj, ok := value.(map[string]any)
+		if !ok {
+			return nil
+		}
+		for i := 0; i < t.NumField(); i++ {
+			field := t.Field(i)
+			name := strings.Split(field.Tag.Get("json"), ",")[0]
+			if v, ok := obj[name]; ok {
+				obj[name] = coerceJSON(v, field.Type)
+			}
+		}
+		return obj
+	}
+	return value
+}
+
+func jsonText(value any) string {
+	switch v := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return v
+	case []any:
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			if text := jsonText(item); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, " ")
+	case map[string]any:
+		keys := make([]string, 0, len(v))
+		for key := range v {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+		parts := make([]string, 0, len(keys))
+		for _, key := range keys {
+			if text := jsonText(v[key]); text != "" {
+				parts = append(parts, text)
+			}
+		}
+		return strings.Join(parts, " ")
+	default:
+		return fmt.Sprint(v)
+	}
+}
+
+// responseText returns the JSON object inside a Responses API reply.
+func responseText(raw []byte) (string, error) {
 	var envelope struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
+		OutputText string `json:"output_text"`
+		Output     []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"output"`
 	}
-	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope.Choices) == 0 {
-		return Intent{}, fmt.Errorf("invalid openai response")
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		return "", errors.New("invalid llm response")
 	}
+	text := envelope.OutputText
+	if text == "" {
+		var parts []string
+		for _, item := range envelope.Output {
+			if item.Type != "message" {
+				continue
+			}
+			for _, content := range item.Content {
+				if content.Type == "output_text" {
+					parts = append(parts, content.Text)
+				}
+			}
+		}
+		text = strings.Join(parts, "")
+	}
+	start, end := strings.Index(text, "{"), strings.LastIndex(text, "}")
+	if start < 0 || end < start {
+		return "", errors.New("llm response contained no JSON object")
+	}
+	return text[start : end+1], nil
+}
+
+func (o *OpenAI) ExtractIntent(ctx context.Context, message string) (Intent, error) {
 	var out Intent
-	if err := json.Unmarshal([]byte(envelope.Choices[0].Message.Content), &out); err != nil {
+	if err := o.respondJSON(ctx, intentInstructions, message, &out); err != nil {
 		return Intent{}, err
 	}
 	return out, nil
 }
 
 func (o *OpenAI) ExplainComparison(ctx context.Context, items []Listing) ([]CompareRecommendation, string, error) {
-	if len(items) == 0 || len(items) > 3 || o.Key == "" {
+	if len(items) == 0 || len(items) > 3 {
 		return nil, "", fmt.Errorf("comparison is not available")
 	}
 	compact := make([]map[string]any, 0, len(items))
@@ -1483,47 +1656,12 @@ func (o *OpenAI) ExplainComparison(ctx context.Context, items []Listing) ([]Comp
 			"features": item.Features, "description": item.Description,
 		})
 	}
-	payload, _ := json.Marshal(compact)
-	system := "You are a careful Persian used-car advisor. Compare only the supplied real listings. Never invent facts, prices, features, or IDs. Return JSON with recommendations (one object per listing, preserving IDs) and overall_recommendation. Each recommendation must have id, title, fit, tradeoffs (array), best_for. Mention uncertainty when source data is missing."
-	body := map[string]any{
-		"model": o.Model, "temperature": 0, "response_format": map[string]string{"type": "json_object"},
-		"messages": []map[string]string{{"role": "system", "content": system}, {"role": "user", "content": string(payload)}},
-	}
-	b, err := json.Marshal(body)
+	payload, err := json.Marshal(compact)
 	if err != nil {
 		return nil, "", err
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.openai.com/v1/chat/completions", strings.NewReader(string(b)))
-	if err != nil {
-		return nil, "", err
-	}
-	req.Header.Set("Authorization", "Bearer "+o.Key)
-	req.Header.Set("Content-Type", "application/json")
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 300 {
-		return nil, "", fmt.Errorf("openai comparison status %s", resp.Status)
-	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 128<<10))
-	if err != nil {
-		return nil, "", fmt.Errorf("openai comparison response read failed")
-	}
-	var envelope struct {
-		Choices []struct {
-			Message struct {
-				Content string `json:"content"`
-			} `json:"message"`
-		} `json:"choices"`
-	}
-	if err := json.Unmarshal(raw, &envelope); err != nil || len(envelope.Choices) == 0 {
-		return nil, "", fmt.Errorf("invalid openai comparison response")
 	}
 	var result CompareResponse
-	if err := json.Unmarshal([]byte(envelope.Choices[0].Message.Content), &result); err != nil {
+	if err := o.respondJSON(ctx, comparisonInstructions, string(payload), &result); err != nil {
 		return nil, "", err
 	}
 	if len(result.Recommendations) != len(items) {
@@ -1533,10 +1671,16 @@ func (o *OpenAI) ExplainComparison(ctx context.Context, items []Listing) ([]Comp
 	for _, item := range items {
 		valid[item.ID] = true
 	}
+	seen := make(map[int64]bool, len(items))
 	for _, recommendation := range result.Recommendations {
-		if !valid[recommendation.ID] || strings.TrimSpace(recommendation.Fit) == "" || strings.TrimSpace(recommendation.BestFor) == "" {
+		if !valid[recommendation.ID] || seen[recommendation.ID] || strings.TrimSpace(recommendation.Fit) == "" || strings.TrimSpace(recommendation.BestFor) == "" {
 			return nil, "", fmt.Errorf("comparison response contained an invalid recommendation")
 		}
+		seen[recommendation.ID] = true
 	}
-	return result.Recommendations, strings.TrimSpace(result.OverallRecommendation), nil
+	overall := strings.TrimSpace(result.OverallRecommendation)
+	if overall == "" {
+		return nil, "", fmt.Errorf("comparison response had no overall recommendation")
+	}
+	return result.Recommendations, overall, nil
 }

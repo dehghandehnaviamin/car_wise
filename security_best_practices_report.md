@@ -42,7 +42,7 @@ The review covered the Go `net/http` API, Vue 3/Vite frontend, OpenAI integratio
 - Location: `web/src/App.vue:28-36,81`.
 - Evidence: listing data controls `image_url` and `source_url` fields rendered by the browser.
 - Impact: a poisoned snapshot could cause navigation to an unexpected scheme or host.
-- Fix: the UI accepts HTTPS images only and allows source links only for the known public listing domains; links use `noopener noreferrer`.
+- Fix: the UI accepts HTTPS images only from the known listing CDNs and allows source links only for the known public listing domains; links use `noopener noreferrer`.
 
 ### SEC-006 — Low — Third-party font is an explicit supply-chain dependency (accepted/documented)
 

@@ -8,6 +8,7 @@ Karwise is a production-shaped local MVP for an AI-assisted used-car buying work
 cp .env.example .env
 # Change POSTGRES_PASSWORD and the matching DATABASE_URL value for a shared machine.
 # Add OPENAI_API_KEY for LLM intent extraction and comparison explanations (optional).
+# Set OPENAI_BASE_URL to a compatible provider or proxy when needed.
 docker compose up --build
 ```
 
@@ -21,6 +22,7 @@ Open <http://localhost:5173>. The API is available at <http://localhost:8080/api
 - PostgreSQL is pgvector-ready. The first demo uses text retrieval for predictable startup; embeddings can be added without changing the domain model.
 - Smart search is the default UI mode. A deterministic Persian parser remains authoritative for colors, origin, body condition, budget, model year, mileage, class, transmission, usage, economy, luxury, options, comfort, and fuel intent; the LLM cannot invent a model or relax a hard constraint.
 - Compare accepts two or three real listing IDs only. The API returns every compared listing plus a per-car explanation, trade-offs, and best-fit use case. OpenAI provides the wording when configured; a deterministic fallback keeps the demo functional without an API key.
+- OpenAI-compatible chat completions use OPENAI_BASE_URL (default: https://api.openai.com/v1), so a proxy or compatible provider can be configured without code changes.
 
 ## Real listing snapshots
 

@@ -1,6 +1,60 @@
 package main
 
-import "testing"
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestOpenAIResponsesURLUsesCustomBaseURL(t *testing.T) {
+	for _, test := range []struct {
+		baseURL string
+		want    string
+	}{
+		{baseURL: "https://api.example.com/v1", want: "https://api.example.com/v1/responses"},
+		{baseURL: "https://api.example.com/v1/", want: "https://api.example.com/v1/responses"},
+		{baseURL: "", want: "https://api.openai.com/v1/responses"},
+	} {
+		ai := OpenAI{BaseURL: test.baseURL}
+		if got := ai.responsesURL(); got != test.want {
+			t.Fatalf("base URL %q: got %q, want %q", test.baseURL, got, test.want)
+		}
+	}
+}
+
+func TestResponseTextExtractsJSONFromMessageOutput(t *testing.T) {
+	raw := []byte(`{"output":[{"type":"reasoning","content":[]},{"type":"message","content":[{"type":"output_text","text":"` + "```json\\n{\\\"city\\\":\\\"تهران\\\"}\\n```" + `"}]}]}`)
+	got, err := responseText(raw)
+	if err != nil || got != `{"city":"تهران"}` {
+		t.Fatalf("got %q, %v", got, err)
+	}
+}
+
+func TestExtractIntentUsesResponsesAPI(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if r.URL.Path != "/v1/responses" || body["input"] != "ماشین در تهران" || body["instructions"] == nil {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"output_text":"{\"city\":\"تهران\"}"}`))
+	}))
+	defer server.Close()
+	ai := OpenAI{Key: "test", Model: "test-model", BaseURL: server.URL + "/v1"}
+	intent, err := ai.ExtractIntent(context.Background(), "ماشین در تهران")
+	if err != nil || intent.City != "تهران" {
+		t.Fatalf("got %+v, %v", intent, err)
+	}
+}
+
+func TestExtractIntentErrorsWithoutKeySoCallerFallsBack(t *testing.T) {
+	if _, err := (&OpenAI{}).ExtractIntent(context.Background(), "پراید"); err == nil {
+		t.Fatal("expected an error when no API key is configured")
+	}
+}
 
 func TestHeuristicIntentParsesPersianBudgetAndPriorities(t *testing.T) {
 	intent := heuristicIntent("یه ماشین پرآپشن بین ۲ تا ۴ میلیارد بدون رنگ برای شهر میخوام")
@@ -82,5 +136,22 @@ func TestHeuristicIntentRespectsNegations(t *testing.T) {
 		if value == "luxury" || value == "economic" || value == "options" {
 			t.Fatalf("positive criteria leaked through negations: %#v", intent.Priorities)
 		}
+	}
+}
+
+func TestLenientUnmarshalCoercesNearMissShapes(t *testing.T) {
+	var intent Intent
+	if err := lenientUnmarshal([]byte(`{"usage":"family","city":["تهران"],"max_price_irr":"50000000000"}`), &intent); err != nil {
+		t.Fatal(err)
+	}
+	if len(intent.Usage) != 1 || intent.Usage[0] != "family" || intent.City != "تهران" || intent.MaxPriceIRR != 50000000000 {
+		t.Fatalf("unexpected intent %+v", intent)
+	}
+	var compare CompareResponse
+	if err := lenientUnmarshal([]byte(`{"recommendations":[{"id":"7","fit":"خوب","best_for":"شهر","tradeoffs":"مصرف"}],"overall_recommendation":{"choice":"گزینه ۷"}}`), &compare); err != nil {
+		t.Fatal(err)
+	}
+	if compare.OverallRecommendation != "گزینه ۷" || compare.Recommendations[0].ID != 7 || len(compare.Recommendations[0].Tradeoffs) != 1 {
+		t.Fatalf("unexpected comparison %+v", compare)
 	}
 }
