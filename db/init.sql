@@ -1,0 +1,1 @@
+-- Schema is applied by the Go service so local and container startup share one path.
